@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Runtime Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.0/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.344.0/dist/umd/lucide.min.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-2 md:p-4">
+  <style>
+    #root > div { width: 100% !important; max-width: 100% !important; margin: 0 !important; }
+  </style>
+
+  <div id="root">
+    <div class="min-h-screen flex flex-col items-center justify-center p-6 text-center">
+      <div class="h-8 w-8 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin mb-4"></div>
+      <p class="text-sm font-mono tracking-widest text-cyan-400 uppercase">Mounting Node...</p>
+    </div>
+  </div>
+
+  <script>
+    window.useState = React.useState;
+    window.useEffect = React.useEffect;
+    window.useMemo = React.useMemo;
+    window.useCallback = React.useCallback;
+    window.useRef = React.useRef;
+
+    function renderError(stage, msg) {
+      document.getElementById('root').innerHTML = `
+        <div class="min-h-screen bg-slate-950 p-6 flex items-center justify-center font-sans">
+          <div class="max-w-lg w-full bg-slate-900 border border-red-500/40 rounded-2xl p-6 text-slate-200 shadow-2xl">
+            <h2 class="text-red-400 font-bold mb-2 flex items-center gap-2 text-base">
+              <span>❌</span> ${stage}
+            </h2>
+            <pre class="p-3 bg-slate-950 rounded border border-slate-800 text-[11px] font-mono text-red-300 overflow-x-auto whitespace-pre-wrap">${msg}</pre>
+          </div>
+        </div>
+      `;
+    }
+
+    async function initRuntime() {
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        let toolName = urlParams.get('tool') || 'gen3000_analytics_node.jsx';
+
+        const res = await fetch(toolName + '?t=' + Date.now());
+        if (!res.ok) throw new Error(`Could not load ${toolName} (HTTP ${res.status})`);
+        
+        let code = await res.text();
+        code = code.trim();
+
+        // 1. Clean markdown fences
+        if (code.startsWith('```')) {
+          code = code.split('\n').slice(1).join('\n');
+        }
+        if (code.endsWith('```')) {
+          code = code.slice(0, code.lastIndexOf('```')).trim();
+        }
+
+        // 2. Discover imported icons and inject global SVG mocks
+        const iconMatches = code.matchAll(/import\s*\{([^}]+)\}\s*from\s*['"][^'"]+['"]/g);
+        for (const match of iconMatches) {
+          match[1].split(',').forEach(item => {
+            const name = item.trim().split(/\s+as\s+/)[0].trim();
+            if (name && !['useState', 'useEffect', 'useMemo', 'useCallback', 'useRef'].includes(name)) {
+              window[name] = function(props) {
+                return React.createElement('svg', {
+                  className: (props && props.className) ? props.className : 'w-4 h-4 inline-block text-cyan-400',
+                  viewBox: '0 0 24 24',
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  strokeWidth: 2,
+                  strokeLinecap: 'round',
+                  strokeLinejoin: 'round'
+                }, React.createElement('circle', { cx: 12, cy: 12, r: 8 }), React.createElement('line', { x1: 12, y1: 8, x2: 12, y2: 12 }));
+              };
+            }
+          });
+        }
+
+        // 3. Strip import lines completely
+        code = code.replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g, '');
+
+        // 4. Ensure trailing closing braces
+        if (code.endsWith(');')) {
+          code += '\n}\n';
+        }
+
+        // 5. Rewrite export default to assign directly to window.__ActiveApp
+        window.__ActiveApp = null;
+        if (/export\s+default\s+function\s*([A-Za-z0-9_]*)\s*\(/.test(code)) {
+          code = code.replace(/export\s+default\s+function\s*([A-Za-z0-9_]*)\s*\(/, 'window.__ActiveApp = function $1(');
+        } else if (/export\s+default\s+/.test(code)) {
+          code = code.replace(/export\s+default\s+([^;]+);?/, 'window.__ActiveApp = $1;');
+        }
+
+        const transSource = `
+          ${code}
+          if (!window.__ActiveApp) {
+            if (typeof App !== 'undefined') window.__ActiveApp = App;
+            else if (typeof Widget !== 'undefined') window.__ActiveApp = Widget;
+            else if (typeof Dashboard !== 'undefined') window.__ActiveApp = Dashboard;
+          }
+        `;
+
+        // 6. Transpile with Babel
+        let transformed;
+        try {
+          transformed = Babel.transform(transSource, {
+            presets: ['react'],
+            filename: toolName
+          }).code;
+        } catch (transErr) {
+          renderError('Babel Transformation Error', transErr.message);
+          return;
+        }
+
+        // 7. Execute in page context
+        try {
+          const scriptEl = document.createElement('script');
+          scriptEl.text = transformed;
+          document.body.appendChild(scriptEl);
+        } catch (execErr) {
+          renderError('Script Execution Error', execErr.message);
+          return;
+        }
+
+        // 8. Mount
+        if (window.__ActiveApp) {
+          const root = ReactDOM.createRoot(document.getElementById('root'));
+          root.render(React.createElement(window.__ActiveApp));
+        } else {
+          renderError('Component Resolution Fault', `No viable component found in ${toolName}.`);
+        }
+
+      } catch (err) {
+        renderError('Runtime Fault', err.message);
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', initRuntime);
+  </script>
+</body>
+</html>
